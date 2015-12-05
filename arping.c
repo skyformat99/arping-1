@@ -72,20 +72,33 @@ struct device {
 #endif
 };
 
+struct ethhrd {
+        char dst[6];
+        char src[6];
+        unsigned short type;
+};
+
 int quit_on_reply=0;
+int no_reply=0;
 struct device device = {
 	.name = DEFAULT_DEVICE,
 };
-char *source;
+char *source_ip;
+char *source_mac;
 struct in_addr src, dst;
-char *target;
+char *target_ip;
+char *target_mac;
+char src_mac[6];
+char dst_mac[6];
 int dad, unsolicited, advert;
 int quiet;
 int count=-1;
 int timeout;
+int interval=1;
 int unicasting;
 int s;
 int broadcast_only;
+int sock_type=SOCK_DGRAM;
 
 struct sockaddr_storage me;
 struct sockaddr_storage he;
@@ -117,22 +130,27 @@ static inline socklen_t sll_len(size_t halen)
 void usage(void)
 {
 	fprintf(stderr,
-		"Usage: arping [-fqbDUAV] [-c count] [-w timeout] [-I device] [-s source] destination\n"
+		"Usage: arping [-fqbuDUAV] [-c count] [-w timeout] [-I device]"
+		" [-s source-ip] [-S source-mac] [-d desc-mac] destination\n"
 		"  -f : quit on first reply\n"
 		"  -q : be quiet\n"
 		"  -b : keep broadcasting, don't go unicast\n"
+		"  -u : always unicast\n"
 		"  -D : duplicate address detection mode\n"
 		"  -U : Unsolicited ARP mode, update your neighbours\n"
 		"  -A : ARP answer mode, update your neighbours\n"
 		"  -V : print version and exit\n"
 		"  -c count : how many packets to send\n"
 		"  -w timeout : how long to wait for a reply\n"
+		"  -i interval : interval in seconds between sending packets\n"
 		"  -I device : which ethernet device to use"
 #ifdef DEFAULT_DEVICE_STR
 			" (" DEFAULT_DEVICE_STR ")"
 #endif
 			"\n"
-		"  -s source : source ip address\n"
+		"  -s source-ip : source ip address\n"
+		"  -S source-mac : source MAC address\n"
+		"  -d dest-mac : MAC address of destination\n"
 		"  destination : ask for what ip address\n"
 		);
 	exit(2);
@@ -273,8 +291,15 @@ int send_pack(int s, struct in_addr src, struct in_addr dst,
 	int err;
 	struct timeval now;
 	unsigned char buf[256];
-	struct arphdr *ah = (struct arphdr*)buf;
+	struct ethhrd *eh = (struct ethhrd*)buf;
+	struct arphdr *ah = (struct arphdr*)(eh + (sock_type == SOCK_RAW));
 	unsigned char *p = (unsigned char *)(ah+1);
+
+        if (sock_type == SOCK_RAW) {
+                memcpy(eh->dst, dst_mac, sizeof(dst_mac));
+                memcpy(eh->src, src_mac, sizeof(src_mac));
+                eh->type = htons(ETH_P_ARP);
+        }
 
 	ah->ar_hrd = htons(ME->sll_hatype);
 	if (ah->ar_hrd == htons(ARPHRD_FDDI))
@@ -293,6 +318,7 @@ int send_pack(int s, struct in_addr src, struct in_addr dst,
 	if (advert)
 		memcpy(p, &ME->sll_addr, ah->ar_hln);
 	else
+                // it could be set to all-zero
 		memcpy(p, &HE->sll_addr, ah->ar_hln);
 	p+=ah->ar_hln;
 
@@ -360,7 +386,7 @@ void catcher(void)
 		if (count == 0 && unsolicited)
 			finish();
 	}
-	alarm(1);
+	alarm(interval);
 }
 
 void print_hex(unsigned char *p, int len)
@@ -376,11 +402,16 @@ void print_hex(unsigned char *p, int len)
 int recv_pack(unsigned char *buf, int len, struct sockaddr_ll *FROM)
 {
 	struct timeval tv;
-	struct arphdr *ah = (struct arphdr*)buf;
+	struct ethhrd *eh = (struct ethhrd*)buf;
+	struct arphdr *ah = (struct arphdr*)(eh + (sock_type == SOCK_RAW));
 	unsigned char *p = (unsigned char *)(ah+1);
 	struct in_addr src_ip, dst_ip;
 
 	gettimeofday(&tv, NULL);
+
+        /* no reply mode */
+        if (no_reply)
+                return 0;
 
 	/* Filter out wild packets */
 	if (FROM->sll_pkttype != PACKET_HOST &&
@@ -1005,17 +1036,13 @@ main(int argc, char **argv)
 	setlocale(LC_ALL, "");
 #endif
 
-	enable_capability_raw();
-
-	s = socket(PF_PACKET, SOCK_DGRAM, 0);
-	socket_errno = errno;
-
-	disable_capability_raw();
-
-	while ((ch = getopt(argc, argv, "h?bfDUAqc:w:s:I:V")) != EOF) {
+	while ((ch = getopt(argc, argv, "h?bufDUAqc:w:s:S:d:i:I:V")) != EOF) {
 		switch(ch) {
 		case 'b':
 			broadcast_only=1;
+			break;
+		case 'u':
+			unicasting=1;
 			break;
 		case 'D':
 			dad++;
@@ -1037,6 +1064,9 @@ main(int argc, char **argv)
 		case 'w':
 			timeout = atoi(optarg);
 			break;
+		case 'i':
+			interval = atoi(optarg);
+			break;
 		case 'I':
 			device.name = optarg;
 			break;
@@ -1044,7 +1074,22 @@ main(int argc, char **argv)
 			quit_on_reply=1;
 			break;
 		case 's':
-			source = optarg;
+			source_ip = optarg;
+			break;
+		case 'S':
+			source_mac = optarg;
+			sscanf(source_mac, "%2x:%2x:%2x:%2x:%2x:%2x",
+					&src_mac[0], &src_mac[1], &src_mac[2],
+					&src_mac[3], &src_mac[4], &src_mac[5]);
+                        sock_type=SOCK_RAW;
+			break;
+		case 'd':
+			target_mac = optarg;
+			sscanf(target_mac, "%2x:%2x:%2x:%2x:%2x:%2x",
+					&dst_mac[0], &dst_mac[1], &dst_mac[2],
+					&dst_mac[3], &dst_mac[4], &dst_mac[5]);
+			unicasting=1;
+                        sock_type=SOCK_RAW;
 			break;
 		case 'V':
 			printf("arping utility, iputils-%s\n", SNAPSHOT);
@@ -1060,11 +1105,18 @@ main(int argc, char **argv)
 
 	if (argc != 1)
 		usage();
-
-	target = *argv;
+		
+	target_ip = *argv;
 
 	if (device.name && !*device.name)
 		device.name = NULL;
+
+	enable_capability_raw();
+
+        s = socket(PF_PACKET, sock_type, 0);
+	socket_errno = errno;
+
+	disable_capability_raw();
 
 	if (s < 0) {
 		errno = socket_errno;
@@ -1084,13 +1136,13 @@ main(int argc, char **argv)
 		usage();
 	}
 
-	if (inet_aton(target, &dst) != 1) {
+	if (inet_aton(target_ip, &dst) != 1) {
 		struct hostent *hp;
-		char *idn = target;
+		char *idn = target_ip;
 #ifdef USE_IDN
 		int rc;
 
-		rc = idna_to_ascii_lz(target, &idn, 0);
+		rc = idna_to_ascii_lz(target_ip, &idn, 0);
 
 		if (rc != IDNA_SUCCESS) {
 			fprintf(stderr, "arping: IDN encoding failed: %s\n", idna_strerror(rc));
@@ -1100,7 +1152,7 @@ main(int argc, char **argv)
 
 		hp = gethostbyname2(idn, AF_INET);
 		if (!hp) {
-			fprintf(stderr, "arping: unknown host %s\n", target);
+			fprintf(stderr, "arping: unknown host %s\n", target_ip);
 			exit(2);
 		}
 
@@ -1111,15 +1163,15 @@ main(int argc, char **argv)
 		memcpy(&dst, hp->h_addr, 4);
 	}
 
-	if (source && inet_aton(source, &src) != 1) {
-		fprintf(stderr, "arping: invalid source %s\n", source);
+	if (source_ip && inet_aton(source_ip, &src) != 1) {
+		fprintf(stderr, "arping: invalid source ip %s\n", source_ip);
 		exit(2);
 	}
 
 	if (!dad && unsolicited && src.s_addr == 0)
 		src = dst;
 
-	if (!dad || src.s_addr) {
+	if ((sock_type != SOCK_RAW) && (!dad || src.s_addr)) {
 		struct sockaddr_in saddr;
 		int probe_fd = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -1188,8 +1240,15 @@ main(int argc, char **argv)
 
 	he = me;
 
-	set_device_broadcast(&device, ((struct sockaddr_ll *)&he)->sll_addr,
-			     ((struct sockaddr_ll *)&he)->sll_halen);
+        if (unicasting) {
+                if (memcmp(((struct sockaddr_ll *)&me)->sll_addr, src_mac, sizeof(src_mac)))
+                        no_reply = 1;
+                memcpy(((struct sockaddr_ll *)&me)->sll_addr, src_mac, sizeof(src_mac));
+                memcpy(((struct sockaddr_ll *)&he)->sll_addr, dst_mac, sizeof(dst_mac));
+        } else {
+                set_device_broadcast(&device, ((struct sockaddr_ll *)&he)->sll_addr,
+                                     ((struct sockaddr_ll *)&he)->sll_halen);
+        }
 
 	if (!quiet) {
 		printf("ARPING %s ", inet_ntoa(dst));
@@ -1197,7 +1256,7 @@ main(int argc, char **argv)
 	}
 
 	if (!src.s_addr && !dad) {
-		fprintf(stderr, "arping: no source address in not-DAD mode\n");
+		fprintf(stderr, "arping: no source ip address in not-DAD mode\n");
 		exit(2);
 	}
 
